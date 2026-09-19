@@ -1,0 +1,1471 @@
+
+# NOVA VITAL ADVISOR OS - SINGLE FILE PRODUCTION BUILD
+# Paste this ENTIRE file into GitHub as app.py
+# Requirements: streamlit, pandas, plotly, reportlab, openpyxl
+
+import streamlit as st
+import pandas as pd
+import os, re, json, shutil, io, sqlite3, urllib.parse
+from datetime import datetime, date, timedelta
+import plotly.express as px
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+
+st.set_page_config(page_title="Nova Vital Advisor OS", page_icon="💎", layout="wide", initial_sidebar_state="expanded")
+
+# ==================== DATABASE.PY ====================
+
+import sqlite3, os, json, shutil
+from datetime import datetime
+from pathlib import Path
+
+DB_FILE = os.getenv("NOVA_DB", "nova_vital.db")
+JSON_LEGACY = "financial_db.json"
+
+def get_conn():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    cur.execute("""CREATE TABLE IF NOT EXISTS clients (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        phone TEXT,
+        email TEXT,
+        address TEXT,
+        company TEXT,
+        notes TEXT,
+        created_at TEXT
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        client_id INTEGER,
+        client_name TEXT,
+        client_phone TEXT,
+        client_email TEXT,
+        address TEXT,
+        start_date TEXT,
+        due_date TEXT,
+        material_budget REAL DEFAULT 0,
+        labor_pct REAL DEFAULT 40,
+        transport_budget REAL DEFAULT 0,
+        other_budget REAL DEFAULT 0,
+        markup_pct REAL DEFAULT 25,
+        contract_value REAL DEFAULT 0,
+        status TEXT DEFAULT 'Active',
+        notes TEXT DEFAULT '',
+        created_at TEXT,
+        updated_at TEXT,
+        FOREIGN KEY(client_id) REFERENCES clients(id)
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS expenses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        expense_date TEXT,
+        category TEXT,
+        description TEXT,
+        amount REAL,
+        supplier TEXT DEFAULT '',
+        worker TEXT DEFAULT '',
+        receipt_ref TEXT DEFAULT '',
+        is_unplanned INTEGER DEFAULT 0,
+        billable_status TEXT DEFAULT 'Non-Billable',
+        created_at TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        payment_date TEXT,
+        description TEXT,
+        amount REAL,
+        payment_type TEXT DEFAULT 'Progress Payment',
+        method TEXT DEFAULT 'EFT',
+        reference TEXT DEFAULT '',
+        created_at TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS variations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        variation_no TEXT UNIQUE,
+        variation_date TEXT,
+        description TEXT,
+        material_cost REAL DEFAULT 0,
+        labor_cost REAL DEFAULT 0,
+        transport_cost REAL DEFAULT 0,
+        other_cost REAL DEFAULT 0,
+        markup_pct REAL DEFAULT 25,
+        client_price REAL DEFAULT 0,
+        cost_price REAL DEFAULT 0,
+        status TEXT DEFAULT 'Pending',
+        created_at TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS procurement (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        item TEXT,
+        quantity REAL DEFAULT 1,
+        unit TEXT DEFAULT 'pcs',
+        supplier TEXT DEFAULT '',
+        quoted_price REAL DEFAULT 0,
+        actual_price REAL DEFAULT 0,
+        ordered INTEGER DEFAULT 0,
+        received INTEGER DEFAULT 0,
+        expected_date TEXT,
+        status TEXT DEFAULT 'Required',
+        created_at TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS workers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        phone TEXT DEFAULT '',
+        role TEXT DEFAULT 'Installer',
+        default_rate REAL DEFAULT 0,
+        skill_level TEXT DEFAULT 'Medium',
+        is_active INTEGER DEFAULT 1,
+        notes TEXT DEFAULT '',
+        created_at TEXT
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS worker_payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        worker_id INTEGER NOT NULL,
+        payment_date TEXT,
+        days REAL DEFAULT 0,
+        rate REAL DEFAULT 0,
+        amount REAL DEFAULT 0,
+        description TEXT DEFAULT '',
+        created_at TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+        FOREIGN KEY(worker_id) REFERENCES workers(id)
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        title TEXT,
+        due_date TEXT,
+        assigned_to TEXT DEFAULT '',
+        priority TEXT DEFAULT 'Medium',
+        status TEXT DEFAULT 'Pending',
+        progress INTEGER DEFAULT 0,
+        created_at TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS snags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        description TEXT,
+        priority TEXT DEFAULT 'Medium',
+        assigned_to TEXT DEFAULT '',
+        due_date TEXT,
+        status TEXT DEFAULT 'Open',
+        created_at TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS site_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id INTEGER NOT NULL,
+        log_date TEXT,
+        workers TEXT,
+        arrival TEXT DEFAULT '',
+        departure TEXT DEFAULT '',
+        work_done TEXT,
+        materials_used TEXT,
+        issues TEXT,
+        client_instructions TEXT DEFAULT '',
+        weather TEXT DEFAULT '',
+        notes TEXT,
+        created_at TEXT,
+        FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item TEXT UNIQUE,
+        category TEXT,
+        quantity REAL DEFAULT 0,
+        unit TEXT DEFAULT 'pcs',
+        reorder_level REAL DEFAULT 5,
+        unit_cost REAL DEFAULT 0,
+        supplier TEXT DEFAULT '',
+        location TEXT DEFAULT 'Workshop',
+        created_at TEXT
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS inventory_moves (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        inventory_id INTEGER,
+        move_date TEXT,
+        qty_change REAL,
+        reason TEXT,
+        project_id INTEGER,
+        created_at TEXT
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS leads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        company TEXT DEFAULT '',
+        phone TEXT,
+        email TEXT DEFAULT '',
+        source TEXT DEFAULT 'Referral',
+        project_type TEXT DEFAULT '',
+        estimated_value REAL DEFAULT 0,
+        status TEXT DEFAULT 'New',
+        notes TEXT DEFAULT '',
+        created_at TEXT
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS quotes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        quote_no TEXT UNIQUE,
+        project_id INTEGER,
+        client_id INTEGER,
+        client_name TEXT,
+        client_phone TEXT,
+        address TEXT,
+        description TEXT,
+        subtotal REAL DEFAULT 0,
+        labor_total REAL DEFAULT 0,
+        transport_total REAL DEFAULT 0,
+        markup_pct REAL DEFAULT 25,
+        markup_value REAL DEFAULT 0,
+        discount REAL DEFAULT 0,
+        vat_pct REAL DEFAULT 0,
+        vat_value REAL DEFAULT 0,
+        total REAL DEFAULT 0,
+        valid_until TEXT,
+        status TEXT DEFAULT 'Draft',
+        terms TEXT DEFAULT '',
+        created_at TEXT
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS quote_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        quote_id INTEGER,
+        description TEXT,
+        qty REAL DEFAULT 1,
+        unit TEXT DEFAULT 'pcs',
+        unit_price REAL DEFAULT 0,
+        line_total REAL DEFAULT 0,
+        FOREIGN KEY(quote_id) REFERENCES quotes(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS invoices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_no TEXT UNIQUE,
+        project_id INTEGER,
+        client_id INTEGER,
+        client_name TEXT,
+        invoice_date TEXT,
+        due_date TEXT,
+        description TEXT,
+        subtotal REAL DEFAULT 0,
+        vat_pct REAL DEFAULT 0,
+        vat_value REAL DEFAULT 0,
+        total REAL DEFAULT 0,
+        amount_paid REAL DEFAULT 0,
+        balance_due REAL DEFAULT 0,
+        status TEXT DEFAULT 'Not Paid',
+        bank_details TEXT DEFAULT '',
+        created_at TEXT
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS invoice_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER,
+        description TEXT,
+        qty REAL DEFAULT 1,
+        unit_price REAL DEFAULT 0,
+        line_total REAL DEFAULT 0,
+        FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+    )""")
+
+    cur.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        action TEXT,
+        entity TEXT,
+        entity_id TEXT,
+        details TEXT,
+        user TEXT DEFAULT 'owner'
+    )""")
+
+    conn.commit()
+    conn.close()
+    # Attempt migration
+    try:
+        migrate_json_if_exists()
+    except Exception as e:
+        print(f"Migration skipped: {e}")
+
+def migrate_json_if_exists():
+    if not os.path.exists(JSON_LEGACY):
+        return
+    if os.path.getsize(JSON_LEGACY) == 0:
+        return
+    backup = f"{JSON_LEGACY}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    shutil.copy(JSON_LEGACY, backup)
+    with open(JSON_LEGACY, "r") as f:
+        data = json.load(f)
+    conn = get_conn()
+    cur = conn.cursor()
+    existing = {r[0] for r in cur.execute("SELECT name FROM projects").fetchall()}
+    for proj_name, pdata in data.get("projects", {}).items():
+        if proj_name in existing:
+            continue
+        cur.execute("""INSERT INTO projects
+            (name, client_name, contract_value, material_budget, labor_pct, status, created_at)
+            VALUES (?,?,?,?,?,?,?)""",
+            (proj_name, pdata.get("client_name",""), pdata.get("contract_value",0), 50000, 40, "Active", datetime.now().isoformat()))
+        pid = cur.lastrowid
+        for exp in pdata.get("expenses", []):
+            cur.execute("""INSERT INTO expenses
+                (project_id, expense_date, category, description, amount, is_unplanned, created_at)
+                VALUES (?,?,?,?,?,?,?)""",
+                (pid, exp.get("Date", datetime.now().date().isoformat()), exp.get("Category","Sundries"), exp.get("Description",""), exp.get("Amount",0), 1 if exp.get("is_unplanned") else 0, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+    log_action("MIGRATION", "system", "json", f"Migrated {JSON_LEGACY} to SQLite, backup {backup}")
+
+def log_action(action, entity, entity_id, details=""):
+    try:
+        conn = get_conn()
+        conn.execute("INSERT INTO audit_log (timestamp, action, entity, entity_id, details) VALUES (?,?,?,?,?)",
+                     (datetime.now().isoformat(), action, entity, str(entity_id), details))
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+def q(sql, params=()):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    conn.close()
+
+def fetch_one(sql, params=()):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def fetch_all(sql, params=()):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+# ==================== FINANCE.PY ====================
+
+import pandas as pd
+
+def project_stats(project_id: int):
+    conn = get_conn()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    if not proj:
+        conn.close()
+        return {}
+    expenses = pd.read_sql_query("SELECT * FROM expenses WHERE project_id=?", conn, params=(project_id,))
+    payments = pd.read_sql_query("SELECT * FROM payments WHERE project_id=?", conn, params=(project_id,))
+    variations = pd.read_sql_query("SELECT * FROM variations WHERE project_id=?", conn, params=(project_id,))
+    worker_pays = pd.read_sql_query("SELECT * FROM worker_payments WHERE project_id=?", conn, params=(project_id,))
+    conn.close()
+
+    material_budget = proj["material_budget"] or 0
+    labor_pct = proj["labor_pct"] or 40
+    labor_budget = material_budget * labor_pct / 100.0
+    transport_budget = proj["transport_budget"] or 0
+    other_budget = proj["other_budget"] or 0
+    total_budget = material_budget + labor_budget + transport_budget + other_budget
+
+    contract_value = proj["contract_value"] or 0
+
+    approved_variations = variations[variations["status"]=="Approved"]["client_price"].sum() if not variations.empty else 0
+    pending_variations = variations[variations["status"].isin(["Pending","Sent"])]["client_price"].sum() if not variations.empty else 0
+
+    revenue = contract_value + approved_variations
+    total_revenue_with_pending = revenue + pending_variations
+
+    spent = expenses["amount"].sum() if not expenses.empty else 0
+    # Avoid double counting: worker_payments are separate but also often logged as expense?
+    # Rule: worker_payments are NOT added to expenses total if already categorized as Labor Pay? 
+    # We treat worker_payments as authoritative labour cost, and if expenses has Labor Pay we use worker_payments instead to avoid double count
+    labor_from_expenses = expenses[expenses["category"]=="Labor Pay"]["amount"].sum() if not expenses.empty else 0
+    labor_from_worker = worker_pays["amount"].sum() if not worker_pays.empty else 0
+    # If worker payments exist, use them as labor cost, not expense labor
+    labor_actual = labor_from_worker if labor_from_worker>0 else labor_from_expenses
+
+    material_actual = expenses[expenses["category"].isin(["Board/Melamine","Hardware & Runners","Quartz/Tops","Boards","Hardware"]) ]["amount"].sum() if not expenses.empty else 0
+    transport_actual = expenses[expenses["category"].isin(["Transport/Fuel","Transport"])]["amount"].sum() if not expenses.empty else 0
+    other_actual = spent - material_actual - labor_from_expenses - transport_actual
+
+    # For profit, total cost = spent - labor_from_expenses + labor_actual (replace)
+    if labor_from_worker>0:
+        total_cost = spent - labor_from_expenses + labor_from_worker
+    else:
+        total_cost = spent
+
+    received = payments["amount"].sum() if not payments.empty else 0
+    outstanding = revenue - received
+    profit = revenue - total_cost
+    margin = (profit / revenue * 100) if revenue else 0
+
+    unplanned = expenses[expenses["is_unplanned"]==1]["amount"].sum() if not expenses.empty else 0
+    potentially_billable = expenses[(expenses["is_unplanned"]==1) & (expenses["billable_status"]=="Potentially Billable")]["amount"].sum() if not expenses.empty else 0
+    billable = expenses[(expenses["is_unplanned"]==1) & (expenses["billable_status"]=="Billable")]["amount"].sum() if not expenses.empty else 0
+
+    return {
+        "material_budget": material_budget,
+        "labor_budget": labor_budget,
+        "transport_budget": transport_budget,
+        "other_budget": other_budget,
+        "total_budget": total_budget,
+        "contract_value": contract_value,
+        "approved_variations": approved_variations,
+        "pending_variations": pending_variations,
+        "revenue": revenue,
+        "total_revenue_with_pending": total_revenue_with_pending,
+        "spent": total_cost,
+        "raw_spent": spent,
+        "received": received,
+        "outstanding": outstanding,
+        "profit": profit,
+        "margin": margin,
+        "labor": labor_actual,
+        "material": material_actual,
+        "transport": transport_actual,
+        "other": other_actual,
+        "unplanned": unplanned,
+        "potentially_billable": potentially_billable,
+        "billable": billable,
+        "labor_pct": labor_pct
+    }
+
+def company_stats():
+    conn = get_conn()
+    projects = pd.read_sql_query("SELECT * FROM projects", conn)
+    conn.close()
+    rows=[]
+    for _, r in projects.iterrows():
+        s = project_stats(int(r["id"]))
+        rows.append({
+            "id": r["id"], "name": r["name"], "status": r["status"],
+            "contract_value": r["contract_value"],
+            **s
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return {"df": df, "total_contract":0,"total_revenue":0,"total_received":0,"total_outstanding":0,"total_spent":0,"total_profit":0,"avg_margin":0}
+    return {
+        "df": df,
+        "total_contract": df["contract_value"].sum(),
+        "total_revenue": df["revenue"].sum(),
+        "total_received": df["received"].sum(),
+        "total_outstanding": df["outstanding"].sum(),
+        "total_spent": df["spent"].sum(),
+        "total_profit": df["profit"].sum(),
+        "avg_margin": df["margin"].mean()
+    }
+
+# ==================== ADVISOR.PY ====================
+
+import pandas as pd
+
+def advisor_text(project_id):
+    conn = get_conn()
+    proj = conn.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone()
+    if not proj:
+        conn.close()
+        return "Project not found."
+    expenses = pd.read_sql_query("SELECT * FROM expenses WHERE project_id=?", conn, params=(project_id,))
+    procurement = pd.read_sql_query("SELECT * FROM procurement WHERE project_id=?", conn, params=(project_id,))
+    inventory = pd.read_sql_query("SELECT * FROM inventory WHERE quantity <= reorder_level", conn)
+    tasks = pd.read_sql_query("SELECT * FROM tasks WHERE project_id=? AND status!='Completed'", conn, params=(project_id,))
+    snags = pd.read_sql_query("SELECT * FROM snags WHERE project_id=? AND status!='Closed'", conn, params=(project_id,))
+    conn.close()
+
+    s = project_stats(project_id)
+    lines=[]
+    lines.append(f"### {proj['name']} - Financial Health")
+
+    if s["labor"] > s["labor_budget"] and s["labor_budget"]>0:
+        lines.append(f"🔴 **Labour overrun:** Budget was R{s['labor_budget']:,.0f} ({s['labor_pct']:.0f}% of material), actual labour is R{s['labor']:,.0f}. Over by R{s['labor']-s['labor_budget']:,.0f}.")
+    elif s["labor_budget"]>0:
+        lines.append(f"🟢 Labour on track: R{s['labor']:,.0f} / R{s['labor_budget']:,.0f}")
+
+    if s["material"] > s["material_budget"] and s["material_budget"]>0:
+        lines.append(f"🔴 **Material overrun:** Quoted R{s['material_budget']:,.0f} but spent R{s['material']:,.0f}. Difference R{s['material']-s['material_budget']:,.0f} may be billable if client changed spec.")
+    
+    if s["transport"] > s["transport_budget"] and s["transport_budget"]>0:
+        lines.append(f"🟡 **Transport overrun:** Budget R{s['transport_budget']:,.0f} vs actual R{s['transport']:,.0f}.")
+
+    if s["outstanding"] > 0:
+        lines.append(f"💰 **Outstanding:** R{s['outstanding']:,.0f} still to collect. Received R{s['received']:,.0f} of R{s['revenue']:,.0f}.")
+
+    if s["margin"] < 20 and s["revenue"]>0:
+        lines.append(f"⚠️ **Low margin:** {s['margin']:.1f}% - Healthy is 35-45%. Consider variation order or cost control.")
+    elif s["revenue"]>0:
+        lines.append(f"✅ **Margin healthy:** {s['margin']:.1f}% profit R{s['profit']:,.0f}")
+
+    if s["billable"]>0:
+        lines.append(f"📄 **Billable extras:** R{s['billable']:,.0f} marked as Billable - ready for invoice/WhatsApp.")
+    if s["potentially_billable"]>0:
+        lines.append(f"❓ **Potentially billable:** R{s['potentially_billable']:,.0f} unplanned but not yet confirmed as billable. Review.")
+
+    if not procurement.empty:
+        not_ordered = procurement[procurement["status"]=="Required"]
+        ordered_not_received = procurement[procurement["status"]=="Ordered"]
+        if not not_ordered.empty:
+            lines.append(f"🔴 **Procurement risk:** {len(not_ordered)} items required but not ordered.")
+        if not ordered_not_received.empty:
+            lines.append(f"🟡 **Procurement delay:** {len(ordered_not_received)} items ordered but not received.")
+
+    if not inventory.empty:
+        lines.append(f"⚠️ **Low stock:** {len(inventory)} inventory items at or below reorder level.")
+
+    if not tasks.empty:
+        overdue = tasks[pd.to_datetime(tasks["due_date"], errors='coerce') < pd.Timestamp.now()]
+        if not overdue.empty:
+            lines.append(f"⏰ **Overdue tasks:** {len(overdue)} tasks overdue.")
+
+    if not snags.empty:
+        lines.append(f"🔧 **Open snags:** {len(snags)} snags still open.")
+
+    if not lines:
+        lines.append("No issues detected. Keep logging daily costs.")
+
+    return "\n\n".join(lines)
+
+def scenario_calc(project_id, extra_spend=0, extra_payment=0, labor_increase_pct=0):
+    s = project_stats(project_id)
+    new_spent = s["spent"] + extra_spend + (s["labor"] * labor_increase_pct/100 if labor_increase_pct else 0)
+    new_received = s["received"] + extra_payment
+    new_profit = s["revenue"] - new_spent
+    new_margin = new_profit / s["revenue"] * 100 if s["revenue"] else 0
+    new_cash = new_received - new_spent
+    new_outstanding = s["revenue"] - new_received
+    return {
+        "new_spent": new_spent,
+        "new_profit": new_profit,
+        "new_margin": new_margin,
+        "new_cash_position": new_cash,
+        "new_outstanding": new_outstanding
+    }
+
+# ==================== WHATSAPP.PY ====================
+
+import re, urllib.parse
+
+def clean_sa_number(phone: str) -> str:
+    if not phone: return ""
+    clean = re.sub(r"\D", "", phone)
+    if clean.startswith("0"):
+        clean = "27" + clean[1:]
+    if not clean.startswith("27") and len(clean)==9:
+        clean = "27" + clean
+    return clean
+
+def wa_link(phone, message):
+    num = clean_sa_number(phone)
+    if not num: return ""
+    return f"https://wa.me/{num}?text={urllib.parse.quote(message)}"
+
+def quote_message(project_name, client_name, quote_no, total):
+    return f"""Hello {client_name},
+
+Your quote {quote_no} for *{project_name}* is ready.
+
+Total: *R{total:,.2f}*
+
+Please review and confirm. Valid for 7 days.
+
+Thanks,
+Nova Vital"""
+
+def variation_message(project_name, client_name, var_no, client_price, description):
+    return f"""Hello {client_name},
+
+Variation {var_no} for *{project_name}*:
+
+{description}
+
+Additional cost: *R{client_price:,.2f}*
+
+Please reply APPROVE to proceed.
+
+Thanks,
+Nova Vital"""
+
+def payment_reminder(project_name, client_name, outstanding):
+    return f"""Hello {client_name},
+
+Friendly reminder for *{project_name}*:
+
+Outstanding balance: *R{outstanding:,.2f}*
+
+Bank: Nova Vital
+Ref: {project_name}
+
+Thanks for your prompt payment."""
+
+def invoice_message(project_name, client_name, inv_no, balance):
+    return f"""Hello {client_name},
+
+Invoice {inv_no} for *{project_name}*:
+
+Balance due: *R{balance:,.2f}*
+
+Please settle as per terms.
+
+Nova Vital"""
+
+# ==================== PDFS.PY ====================
+
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from datetime import datetime
+import os
+
+def _header(c, title, subtitle=""):
+    w,h = A4
+    c.setFillColor(colors.HexColor("#10172a"))
+    c.rect(0, h-70, w, 70, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(20, h-35, "NOVA VITAL")
+    c.setFont("Helvetica", 9)
+    c.drawString(20, h-50, "Kitchen | Carpentry | Renovations | Centurion, Gauteng")
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(w-200, h-35, title)
+    if subtitle:
+        c.setFont("Helvetica", 8)
+        c.drawString(w-200, h-50, subtitle)
+    c.setFillColor(colors.black)
+
+def quote_pdf(quote, items, client_name, address):
+    path = f"/tmp/{quote['quote_no']}.pdf"
+    c = canvas.Canvas(path, pagesize=A4)
+    w,h = A4
+    _header(c, f"QUOTE {quote['quote_no']}", f"Date: {quote['created_at'][:10]} | Valid: {quote['valid_until']}")
+    y = h-100
+    c.setFont("Helvetica", 10)
+    c.drawString(20, y, f"To: {client_name}"); y-=12
+    c.drawString(20, y, f"Site: {address}"); y-=12
+    c.drawString(20, y, f"Project: {quote['description'][:80]}"); y-=20
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(20,y,"Qty | Unit | Description | Unit Price | Total"); y-=12
+    c.setFont("Helvetica", 9)
+    for it in items:
+        if y<80: c.showPage(); _header(c, f"QUOTE {quote['quote_no']} continued"); y=h-100
+        c.drawString(20,y,f"{it['qty']} | {it['unit']} | {it['description'][:40]} | R{it['unit_price']:,.2f} | R{it['line_total']:,.2f}"); y-=12
+    y-=10
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(20,y,f"Subtotal: R{quote['subtotal']:,.2f} | Labour: R{quote['labor_total']:,.2f} | Transport: R{quote['transport_total']:,.2f}"); y-=14
+    c.drawString(20,y,f"Markup {quote['markup_pct']}%: R{quote['markup_value']:,.2f} | Discount: R{quote['discount']:,.2f} | VAT {quote['vat_pct']}%: R{quote['vat_value']:,.2f}"); y-=14
+    c.setFont("Helvetica-Bold",12)
+    c.drawString(20,y,f"TOTAL: R{quote['total']:,.2f}"); y-=20
+    c.setFont("Helvetica",8)
+    c.drawString(20,y, quote['terms'] or "Terms: 60% deposit, 30% on delivery, 10% on completion. Valid 7 days.")
+    c.save()
+    return path
+
+def invoice_pdf(inv, items):
+    path = f"/tmp/{inv['invoice_no']}.pdf"
+    c = canvas.Canvas(path, pagesize=A4)
+    w,h = A4
+    _header(c, f"INVOICE {inv['invoice_no']}", f"Date: {inv['invoice_date']} Due: {inv['due_date']}")
+    y=h-100
+    c.setFont("Helvetica",10)
+    c.drawString(20,y,f"Client: {inv['client_name']} | Project: {inv['description'][:60]}"); y-=20
+    c.setFont("Helvetica-Bold",9)
+    c.drawString(20,y,"Qty | Description | Unit Price | Total"); y-=12
+    c.setFont("Helvetica",9)
+    for it in items:
+        if y<80: c.showPage(); _header(c, f"INVOICE {inv['invoice_no']}"); y=h-100
+        c.drawString(20,y,f"{it['qty']} | {it['description'][:50]} | R{it['unit_price']:,.2f} | R{it['line_total']:,.2f}"); y-=12
+    y-=10
+    c.setFont("Helvetica-Bold",10)
+    c.drawString(20,y,f"Subtotal R{inv['subtotal']:,.2f} VAT R{inv['vat_value']:,.2f} TOTAL R{inv['total']:,.2f}"); y-=14
+    c.drawString(20,y,f"Paid R{inv['amount_paid']:,.2f} | Balance Due R{inv['balance_due']:,.2f} | Status {inv['status']}"); y-=20
+    c.setFont("Helvetica",8)
+    c.drawString(20,y, inv['bank_details'] or "Bank: Nova Vital | Capitec | Acc: 123456 | Ref: Invoice No")
+    c.save()
+    return path
+
+def variation_pdf(var, project_name):
+    path = f"/tmp/{var['variation_no']}.pdf"
+    c = canvas.Canvas(path, pagesize=A4)
+    w,h = A4
+    _header(c, f"VARIATION {var['variation_no']}", f"Project: {project_name} | Status: {var['status']}")
+    y=h-100
+    c.setFont("Helvetica",10)
+    c.drawString(20,y,f"Date: {var['variation_date']} | Description: {var['description']}"); y-=20
+    c.drawString(20,y,f"Material: R{var['material_cost']:,.2f} | Labour: R{var['labor_cost']:,.2f} | Transport: R{var['transport_cost']:,.2f} | Other: R{var['other_cost']:,.2f}"); y-=14
+    c.drawString(20,y,f"Cost Price: R{var['cost_price']:,.2f} | Markup {var['markup_pct']}% | Client Price: R{var['client_price']:,.2f}"); y-=20
+    c.setFont("Helvetica-Bold",11)
+    c.drawString(20,y,f"TOTAL TO BILL: R{var['client_price']:,.2f}")
+    c.save()
+    return path
+
+def project_report_pdf(project, stats, expenses_df):
+    path = f"/tmp/{project['name']}_Report.pdf"
+    c = canvas.Canvas(path, pagesize=A4)
+    w,h = A4
+    _header(c, f"PROJECT REPORT - {project['name']}", f"Status: {project['status']} | {datetime.now().strftime('%Y-%m-%d')}")
+    y=h-100
+    c.setFont("Helvetica",9)
+    c.drawString(20,y,f"Client: {project['client_name']} | {project['client_phone']} | {project['address']}"); y-=12
+    c.drawString(20,y,f"Material Budget R{stats['material_budget']:,.0f} | Labour Budget R{stats['labor_budget']:,.0f} ({stats['labor_pct']}%) | Contract R{stats['contract_value']:,.0f}"); y-=12
+    c.drawString(20,y,f"Revenue R{stats['revenue']:,.0f} (Approved Variations R{stats['approved_variations']:,.0f}) | Received R{stats['received']:,.0f} | Outstanding R{stats['outstanding']:,.0f}"); y-=12
+    c.drawString(20,y,f"Spent R{stats['spent']:,.0f} | Profit R{stats['profit']:,.0f} | Margin {stats['margin']:.1f}%"); y-=20
+    c.setFont("Helvetica-Bold",9)
+    c.drawString(20,y,"Expenses:"); y-=12
+    c.setFont("Helvetica",7)
+    if not expenses_df.empty:
+        for _, r in expenses_df.head(50).iterrows():
+            if y<40: c.showPage(); _header(c, f"REPORT {project['name']} cont."); y=h-80
+            flag = r.get('billable_status','')
+            c.drawString(20,y,f"{r['expense_date']} | {r['category'][:18]} | {str(r['description'])[:45]} | R{r['amount']:,.0f} | {flag}"); y-=10
+    c.save()
+    return path
+
+# ==================== UTILS.PY ====================
+
+import re
+
+def money(v):
+    try:
+        return f"R {float(v):,.2f}"
+    except:
+        return f"R {v}"
+
+def parse_whatsapp_expenses(text):
+    """Parse pasted WhatsApp lines into expense dicts"""
+    results=[]
+    for line in text.splitlines():
+        line=line.strip()
+        if not line: continue
+        # Find amount
+        m = re.search(r'R?\s?(\d{1,3}(?:[\s,]?\d{3})*(?:\.\d+)?|\d+)', line)
+        if not m:
+            continue
+        try:
+            amt = float(m.group(1).replace(',','').replace(' ',''))
+            if amt < 20 or amt>500000: 
+                # filter time stamps like 10:23 and unrealistic
+                if amt < 20: continue
+            low=line.lower()
+            cat="Sundries"
+            if any(k in low for k in ["board","melamine","mdf","pg bison","saligna"]): cat="Board/Melamine"
+            elif any(k in low for k in ["blum","hinge","runner","handle","slide","hardware"]): cat="Hardware & Runners"
+            elif any(k in low for k in ["quartz","granite","top","caesarstone"]): cat="Quartz/Tops"
+            elif any(k in low for k in ["labour","labor","installer","wage","paid"]): cat="Labor Pay"
+            elif any(k in low for k in ["fuel","transport","diesel","uber","taxi","delivery"]): cat="Transport/Fuel"
+            billable="Non-Billable"
+            unplanned=0
+            if any(k in low for k in ["extra","client","bill","additional","variation","unplanned"]):
+                unplanned=1
+                billable="Potentially Billable"
+            results.append({"category":cat,"description":line[:120],"amount":amt,"is_unplanned":unplanned,"billable_status":billable})
+        except:
+            continue
+    return results
+
+# ==================== MAIN APP ====================
+
+init_db()
+
+# --- SECURITY ---
+APP_PIN = os.getenv("NOVA_PIN", "1234")
+if "auth" not in st.session_state:
+    st.session_state.auth=False
+
+def check_pin():
+    st.title("💎 Nova Vital Advisor OS")
+    st.subheader("Contractor ERP | Secure Login")
+    pin = st.text_input("Enter PIN", type="password")
+    if st.button("Unlock"):
+        if pin==APP_PIN:
+            st.session_state.auth=True
+            log_action("LOGIN","auth","owner","successful login")
+            st.rerun()
+        else:
+            st.error("Invalid PIN")
+    st.stop()
+
+if not st.session_state.auth:
+    check_pin()
+
+# --- SIDEBAR NAV ---
+st.sidebar.title("💎 Nova Vital OS")
+pages = ["🏠 Executive Dashboard","📁 Projects","💰 Cash Flow","💳 Payments","📑 Quotes","🧾 Invoices","🔄 Variations","🛒 Procurement","📦 Inventory","👷 Workers","✅ Tasks & Snags","📓 Site Diary","📈 Leads","🤖 AI Advisor","📊 Reports","⚙️ Settings"]
+page = st.sidebar.radio("Navigation", pages, label_visibility="collapsed")
+
+# Helper get projects
+def get_projects_df():
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT * FROM projects ORDER BY created_at DESC", conn)
+    conn.close()
+    return df
+
+projects_df = get_projects_df()
+project_options = {f"{r['name']} ({r['status']})": int(r['id']) for _, r in projects_df.iterrows()} if not projects_df.empty else {}
+
+# --- DASHBOARD ---
+if page=="🏠 Executive Dashboard":
+    st.title("🏠 Executive Dashboard")
+    stats = company_stats()
+    df = stats["df"]
+    if df.empty:
+        st.info("No projects yet. Create your first project in Projects page. Example: Bluevalley (Kitchen) Material R50 000 Labor 40%")
+        st.stop()
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    c1.metric("Active Projects", len(df[df["status"]=="Active"]))
+    c2.metric("Total Contract", money(stats["total_contract"]))
+    c3.metric("Approved Variations", money(df["approved_variations"].sum()))
+    c4.metric("Received", money(stats["total_received"]))
+    c5.metric("Outstanding", money(stats["total_outstanding"]))
+    c6.metric("Projected Profit", money(stats["total_profit"]), f"{stats['avg_margin']:.1f}% avg")
+
+    # Risk warnings
+    risks=[]
+    for _, r in df.iterrows():
+        if r["margin"]<20 and r["revenue"]>0: risks.append(f"🔴 {r['name']}: Low margin {r['margin']:.1f}%")
+        if r["outstanding"]> r["revenue"]*0.3 and r["outstanding"]>5000: risks.append(f"🟡 {r['name']}: High outstanding R{r['outstanding']:,.0f}")
+        if r["spent"]> r["total_budget"]*1.1 and r["total_budget"]>0: risks.append(f"🔴 {r['name']}: Over budget")
+    if risks:
+        st.warning("\n".join(risks[:10]))
+
+    col1,col2 = st.columns(2)
+    with col1:
+        fig=px.bar(df, x="name", y="profit", color="margin", title="Profit by Project", color_continuous_scale="Viridis")
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        fig=px.bar(df, x="name", y="outstanding", title="Outstanding Payments")
+        st.plotly_chart(fig, use_container_width=True)
+
+    col3,col4 = st.columns(2)
+    with col3:
+        # expenses by category
+        conn=get_conn()
+        exp=pd.read_sql_query("SELECT category, SUM(amount) as total FROM expenses GROUP BY category", conn)
+        conn.close()
+        if not exp.empty:
+            fig=px.pie(exp, values="total", names="category", title="Expenses by Category")
+            st.plotly_chart(fig, use_container_width=True)
+    with col4:
+        # monthly revenue vs expenses
+        conn=get_conn()
+        monthly_exp=pd.read_sql_query("SELECT substr(expense_date,1,7) as month, SUM(amount) as total FROM expenses GROUP BY month", conn)
+        monthly_pay=pd.read_sql_query("SELECT substr(payment_date,1,7) as month, SUM(amount) as total FROM payments GROUP BY month", conn)
+        conn.close()
+        if not monthly_exp.empty or not monthly_pay.empty:
+            merged=pd.merge(monthly_exp, monthly_pay, on="month", how="outer", suffixes=("_exp","_pay")).fillna(0)
+            fig=px.line(merged, x="month", y=["total_exp","total_pay"], title="Monthly Cash In vs Out")
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("📊 Company P&L Snapshot")
+    st.dataframe(df[["name","status","revenue","received","outstanding","spent","profit","margin"]], use_container_width=True)
+
+# --- PROJECTS ---
+elif page=="📁 Projects":
+    st.title("📁 Project Management")
+    tab_list, tab_create = st.tabs(["📋 Active Journals", "➕ Create New"])
+    with tab_create:
+        with st.form("create_proj"):
+            a,b,c = st.columns(3)
+            name=a.text_input("Project Name*", placeholder="Bluevalley (Kitchen)")
+            client_name=b.text_input("Client Name")
+            phone=c.text_input("Client WhatsApp", placeholder="0821234567")
+            d,e,f = st.columns(3)
+            email=d.text_input("Client Email")
+            address=e.text_input("Site Address")
+            status=f.selectbox("Status", ["Lead","Quoted","Approved","Active","On Hold","Completed","Cancelled"], index=3)
+            g,h,i,j = st.columns(4)
+            material=g.number_input("Material Budget R", value=50000.0, step=1000.0)
+            labor_pct=h.number_input("Labor % of Material", value=40.0, min_value=0.0, max_value=200.0)
+            transport=i.number_input("Transport Budget R", value=2000.0, step=100.0)
+            markup=j.number_input("Markup %", value=25.0)
+            contract_auto = (material + material*labor_pct/100 + transport) * (1+markup/100)
+            contract=g.number_input("Contract Value R (auto)", value=contract_auto, step=500.0)
+            notes=st.text_area("Notes")
+            start_date=st.date_input("Start Date", date.today())
+            due_date=st.date_input("Due Date", date.today()+timedelta(days=30))
+            if st.form_submit_button("Create Project"):
+                if not name:
+                    st.error("Name required")
+                else:
+                    try:
+                        q("""INSERT INTO projects
+                            (name, client_name, client_phone, client_email, address, material_budget, labor_pct, transport_budget, markup_pct, contract_value, status, notes, start_date, due_date, created_at, updated_at)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                          (name, client_name, phone, email, address, material, labor_pct, transport, markup, contract, status, notes, str(start_date), str(due_date), datetime.now().isoformat(), datetime.now().isoformat()))
+                        log_action("CREATE","project",name,f"Created {name}")
+                        st.success(f"Created {name} | Contract R{contract:,.0f} Labour R{material*labor_pct/100:,.0f}")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Error: {ex} - Maybe project name exists?")
+
+    with tab_list:
+        if projects_df.empty:
+            st.info("No projects")
+        else:
+            for _, proj_row in projects_df.iterrows():
+                pid=int(proj_row["id"])
+                s=project_stats(pid)
+                with st.expander(f"{proj_row['name']} | {proj_row['status']} | Contract {money(proj_row['contract_value'])} | Profit {money(s['profit'])} ({s['margin']:.1f}%)", expanded=False):
+                    tabs = st.tabs(["Overview","Financials","Expenses","Payments","Variations","Procurement","Tasks","Snags","Site Diary","Reports"])
+                    with tabs[0]:
+                        c1,c2 = st.columns(2)
+                        c1.write(f"**Client:** {proj_row['client_name']} | {proj_row['client_phone']} | {proj_row['client_email']}")
+                        c1.write(f"**Site:** {proj_row['address']}")
+                        c1.write(f"**Start:** {proj_row['start_date']} Due: {proj_row['due_date']}")
+                        c2.write(f"Material Budget: {money(s['material_budget'])} | Labour Budget: {money(s['labor_budget'])} ({s['labor_pct']}%) | Transport: {money(s['transport_budget'])}")
+                        c2.write(f"Revenue: {money(s['revenue'])} | Received: {money(s['received'])} | Outstanding: {money(s['outstanding'])}")
+                        st.markdown(advisor_text(pid))
+
+                    with tabs[1]:
+                        st.metric("Projected Profit", money(s["profit"]), f"{s['margin']:.1f}%")
+                        df_fin = pd.DataFrame([{"Item":k,"Amount":v} for k,v in {
+                            "Contract": s["contract_value"], "Approved Variations": s["approved_variations"],
+                            "Revenue": s["revenue"], "Received": s["received"], "Outstanding": s["outstanding"],
+                            "Material Actual": s["material"], "Labor Actual": s["labor"], "Transport Actual": s["transport"],
+                            "Total Spent": s["spent"], "Profit": s["profit"]
+                        }.items()])
+                        st.dataframe(df_fin, use_container_width=True)
+
+                    with tabs[2]:
+                        # WhatsApp paste + expense form
+                        t1,t2 = st.tabs(["Add Expense","Paste WhatsApp"])
+                        with t1:
+                            with st.form(f"exp_{pid}", clear_on_submit=True):
+                                ca,cb = st.columns(2)
+                                ed=ca.date_input("Date", date.today())
+                                cat=cb.selectbox("Category", ["Board/Melamine","Hardware & Runners","Quartz/Tops","Labor Pay","Transport/Fuel","Sundries","Other"])
+                                desc=st.text_input("Description", placeholder="e.g. Thabo 2 days + extra handles")
+                                cc,cd,ce = st.columns(3)
+                                amt=cc.number_input("Amount R", min_value=0.0, step=50.0)
+                                sup=cd.text_input("Supplier")
+                                un=ce.checkbox("Unplanned?")
+                                bill_status=st.selectbox("Billable Status", ["Non-Billable","Potentially Billable","Billable"], index=2 if un else 0)
+                                if st.form_submit_button("Add"):
+                                    if amt>0:
+                                        q("INSERT INTO expenses (project_id, expense_date, category, description, amount, supplier, is_unplanned, billable_status, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                                          (pid, str(ed), cat, desc, amt, sup, 1 if un else 0, bill_status, datetime.now().isoformat()))
+                                        log_action("CREATE","expense",pid,f"{cat} R{amt}")
+                                        st.rerun()
+                        with t2:
+                            wa=st.text_area("Paste WhatsApp", placeholder="[10:23] Thabo: Bought boards R5500\nDiesel R650", height=120, key=f"wa_{pid}")
+                            if st.button("AI Extract", key=f"ai_{pid}"):
+                                parsed=parse_whatsapp_expenses(wa)
+                                for p in parsed:
+                                    q("INSERT INTO expenses (project_id, expense_date, category, description, amount, is_unplanned, billable_status, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                                      (pid, str(date.today()), p["category"], p["description"], p["amount"], p["is_unplanned"], p["billable_status"], datetime.now().isoformat()))
+                                st.success(f"Extracted {len(parsed)} expenses")
+                                st.rerun()
+                        conn=get_conn()
+                        df_exp=pd.read_sql_query("SELECT * FROM expenses WHERE project_id=? ORDER BY expense_date DESC", conn, params=(pid,))
+                        conn.close()
+                        st.dataframe(df_exp, use_container_width=True)
+
+                    with tabs[3]:
+                        with st.form(f"pay_{pid}", clear_on_submit=True):
+                            pa,pb,pc = st.columns(3)
+                            pd_date=pa.date_input("Payment Date", date.today())
+                            amt=pb.number_input("Amount", min_value=0.0, step=100.0)
+                            ptype=pc.selectbox("Type", ["Deposit","Progress Payment","Stage Payment","Final Payment","Other"])
+                            meth=st.selectbox("Method", ["EFT","Cash","Card"])
+                            ref=st.text_input("Reference")
+                            desc=st.text_input("Description")
+                            if st.form_submit_button("Add Payment"):
+                                if amt>0:
+                                    q("INSERT INTO payments (project_id, payment_date, amount, payment_type, method, reference, description, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                                      (pid, str(pd_date), amt, ptype, meth, ref, desc, datetime.now().isoformat()))
+                                    st.rerun()
+                        conn=get_conn()
+                        df_pay=pd.read_sql_query("SELECT * FROM payments WHERE project_id=?", conn, params=(pid,))
+                        conn.close()
+                        st.dataframe(df_pay, use_container_width=True)
+                        if not df_pay.empty:
+                            st.info(f"Received {money(s['received'])} Outstanding {money(s['outstanding'])}")
+
+                    with tabs[4]:
+                        with st.form(f"var_{pid}", clear_on_submit=True):
+                            va,vb = st.columns(2)
+                            vdesc=va.text_input("Variation Description*")
+                            vdate=vb.date_input("Date", date.today())
+                            vc,vd,ve,vf = st.columns(4)
+                            mat_c=vc.number_input("Material Cost", min_value=0.0, step=100.0)
+                            lab_c=vd.number_input("Labour Cost", min_value=0.0, step=100.0)
+                            tr_c=ve.number_input("Transport Cost", min_value=0.0, step=100.0)
+                            mk=vf.number_input("Markup %", value=25.0)
+                            cost_p = mat_c+lab_c+tr_c
+                            client_p = cost_p * (1+mk/100)
+                            st.write(f"Cost R{cost_p:,.0f} -> Client Price R{client_p:,.0f}")
+                            if st.form_submit_button("Create Variation"):
+                                var_no=f"VAR-{datetime.now().strftime('%Y%m%d')}-{pid}-{int(datetime.now().timestamp())%10000}"
+                                q("""INSERT INTO variations
+                                    (project_id, variation_no, variation_date, description, material_cost, labor_cost, transport_cost, markup_pct, cost_price, client_price, status, created_at)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                  (pid, var_no, str(vdate), vdesc, mat_c, lab_c, tr_c, mk, cost_p, client_p, "Pending", datetime.now().isoformat()))
+                                st.success(f"Created {var_no}")
+                                st.rerun()
+                        conn=get_conn()
+                        df_var=pd.read_sql_query("SELECT * FROM variations WHERE project_id=? ORDER BY id DESC", conn, params=(pid,))
+                        conn.close()
+                        st.dataframe(df_var, use_container_width=True)
+                        if not df_var.empty:
+                            for _, vr in df_var.iterrows():
+                                if vr["status"]!="Approved":
+                                    if st.button(f"Approve {vr['variation_no']}", key=f"appr_{vr['id']}"):
+                                        q("UPDATE variations SET status='Approved' WHERE id=?", (int(vr["id"]),))
+                                        log_action("APPROVE","variation",vr["variation_no"],f"Approved R{vr['client_price']}")
+                                        st.rerun()
+                                wa_msg = variation_message(proj_row["name"], proj_row["client_name"] or "Client", vr["variation_no"], vr["client_price"], vr["description"])
+                                st.markdown(f"[💬 WhatsApp Approval for {vr['variation_no']}]({wa_link(proj_row['client_phone'], wa_msg)})")
+
+                    with tabs[5]:
+                        with st.form(f"proc_{pid}", clear_on_submit=True):
+                            pa,pb,pc = st.columns(3)
+                            item=pa.text_input("Item")
+                            qty=pb.number_input("Qty", value=1.0)
+                            unit=pc.text_input("Unit", value="pcs")
+                            pd_,pe,pf = st.columns(3)
+                            sup=pd_.text_input("Supplier")
+                            quoted=pe.number_input("Quoted Price", min_value=0.0)
+                            actual=pf.number_input("Actual Price", min_value=0.0)
+                            if st.form_submit_button("Add Procurement"):
+                                q("INSERT INTO procurement (project_id, item, quantity, unit, supplier, quoted_price, actual_price, status, created_at) VALUES (?,?,?,?,?,?,?, ?,?)",
+                                  (pid, item, qty, unit, sup, quoted, actual, "Required", datetime.now().isoformat()))
+                                st.rerun()
+                        conn=get_conn()
+                        df_proc=pd.read_sql_query("SELECT * FROM procurement WHERE project_id=?", conn, params=(pid,))
+                        conn.close()
+                        st.dataframe(df_proc, use_container_width=True)
+
+                    with tabs[6]:
+                        with st.form(f"task_{pid}", clear_on_submit=True):
+                            ta,tb = st.columns(2)
+                            title=ta.text_input("Task Title")
+                            due=tb.date_input("Due", date.today())
+                            tc,td = st.columns(2)
+                            assign=tc.text_input("Assigned To")
+                            prio=td.selectbox("Priority", ["Low","Medium","High"])
+                            if st.form_submit_button("Add Task"):
+                                q("INSERT INTO tasks (project_id, title, due_date, assigned_to, priority, status, created_at) VALUES (?,?,?,?,?,?,?)",
+                                  (pid, title, str(due), assign, prio, "Pending", datetime.now().isoformat()))
+                                st.rerun()
+                        conn=get_conn()
+                        df_task=pd.read_sql_query("SELECT * FROM tasks WHERE project_id=?", conn, params=(pid,))
+                        conn.close()
+                        st.dataframe(df_task, use_container_width=True)
+
+                    with tabs[7]:
+                        with st.form(f"snag_{pid}", clear_on_submit=True):
+                            sa,sb = st.columns(2)
+                            desc=sa.text_input("Snag Description")
+                            prio=sb.selectbox("Priority", ["Low","Medium","High","Critical"])
+                            sc,sd = st.columns(2)
+                            assign=sc.text_input("Assigned")
+                            due=sd.date_input("Due", date.today())
+                            if st.form_submit_button("Add Snag"):
+                                q("INSERT INTO snags (project_id, description, priority, assigned_to, due_date, status, created_at) VALUES (?,?,?,?,?,?,?)",
+                                  (pid, desc, prio, assign, str(due), "Open", datetime.now().isoformat()))
+                                st.rerun()
+                        conn=get_conn()
+                        df_snag=pd.read_sql_query("SELECT * FROM snags WHERE project_id=?", conn, params=(pid,))
+                        conn.close()
+                        st.dataframe(df_snag, use_container_width=True)
+
+                    with tabs[8]:
+                        with st.form(f"diary_{pid}", clear_on_submit=True):
+                            da,db = st.columns(2)
+                            ld=da.date_input("Log Date", date.today())
+                            workers=db.text_input("Workers Present", placeholder="Thabo, Peter")
+                            work=st.text_area("Work Done")
+                            mat_used=st.text_area("Materials Used")
+                            issues=st.text_area("Issues / Delays")
+                            notes=st.text_area("Notes")
+                            if st.form_submit_button("Save Diary"):
+                                q("INSERT INTO site_logs (project_id, log_date, workers, work_done, materials_used, issues, notes, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                                  (pid, str(ld), workers, work, mat_used, issues, notes, datetime.now().isoformat()))
+                                st.rerun()
+                        conn=get_conn()
+                        df_logs=pd.read_sql_query("SELECT * FROM site_logs WHERE project_id=? ORDER BY log_date DESC", conn, params=(pid,))
+                        conn.close()
+                        st.dataframe(df_logs, use_container_width=True)
+
+                    with tabs[9]:
+                        if st.button(f"Generate Full PDF - {proj_row['name']}", key=f"pdf_{pid}"):
+                            conn=get_conn()
+                            df_exp=pd.read_sql_query("SELECT * FROM expenses WHERE project_id=?", conn, params=(pid,))
+                            conn.close()
+                            path=project_report_pdf(proj_row, s, df_exp)
+                            with open(path,"rb") as f:
+                                st.download_button("Download Report", f, file_name=f"{proj_row['name']}_Report.pdf")
+
+# --- CASH FLOW ---
+elif page=="💰 Cash Flow":
+    st.title("💰 Cash Flow")
+    stats=company_stats()
+    df=stats["df"]
+    if df.empty:
+        st.info("No data")
+        st.stop()
+    conn=get_conn()
+    pay_df=pd.read_sql_query("SELECT payment_date as date, amount FROM payments", conn)
+    exp_df=pd.read_sql_query("SELECT expense_date as date, amount FROM expenses", conn)
+    wp_df=pd.read_sql_query("SELECT payment_date as date, amount FROM worker_payments", conn)
+    conn.close()
+    cash_in = pay_df["amount"].sum() if not pay_df.empty else 0
+    cash_out = (exp_df["amount"].sum() if not exp_df.empty else 0) + (wp_df["amount"].sum() if not wp_df.empty else 0)
+    closing = cash_in - cash_out
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Cash In (Received)", money(cash_in))
+    c2.metric("Cash Out (Expenses+Wages)", money(cash_out))
+    c3.metric("Closing Cash Position", money(closing), delta="Positive" if closing>=0 else "Negative", delta_color="normal" if closing>=0 else "inverse")
+    if closing<0:
+        st.error("🔴 Cash position negative - prioritize collections")
+    if stats["total_outstanding"]>20000:
+        st.warning(f"🟡 R{stats['total_outstanding']:,.0f} outstanding from clients - send reminders")
+    st.dataframe(df[["name","received","spent","outstanding","profit"]], use_container_width=True)
+
+# --- PAYMENTS, QUOTES, INVOICES etc ---
+elif page=="💳 Payments":
+    st.title("💳 All Payments")
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT p.*, pr.name as project_name FROM payments p JOIN projects pr ON p.project_id=pr.id ORDER BY payment_date DESC", conn)
+    conn.close()
+    st.dataframe(df, use_container_width=True)
+
+elif page=="📑 Quotes":
+    st.title("📑 Quotes")
+    with st.form("quote_form"):
+        a,b = st.columns(2)
+        proj_id = a.selectbox("Project", list(project_options.keys()) if project_options else ["No Projects"]) if project_options else None
+        valid_until = b.date_input("Valid Until", date.today()+timedelta(days=7))
+        desc = st.text_area("Project Description")
+        c,d,e = st.columns(3)
+        markup = c.number_input("Markup %", value=25.0)
+        vat = d.number_input("VAT %", value=0.0)
+        discount = e.number_input("Discount R", value=0.0)
+        st.write("Line Items")
+        li1,li2,li3,li4 = st.columns(4)
+        item_desc=li1.text_input("Item")
+        qty=li2.number_input("Qty", value=1.0)
+        unit=li3.text_input("Unit", value="pcs")
+        unit_price=li4.number_input("Unit Price", value=0.0)
+        terms = st.text_area("Terms", value="60% deposit, 30% on delivery, 10% on completion. Valid 7 days.")
+        if st.form_submit_button("Create Quote"):
+            if project_options and proj_id:
+                pid=project_options[proj_id]
+                proj_row=fetch_one("SELECT * FROM projects WHERE id=?", (pid,))
+                subtotal=qty*unit_price
+                markup_val=subtotal*markup/100
+                vat_val=(subtotal+markup_val-discount)*vat/100
+                total=subtotal+markup_val-vat+vat_val-discount
+                quote_no=f"NV-{datetime.now().year}-{int(datetime.now().timestamp())%100000}"
+                q("""INSERT INTO quotes
+                    (quote_no, project_id, client_name, client_phone, address, description, subtotal, markup_pct, markup_value, discount, vat_pct, vat_value, total, valid_until, terms, status, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?)""",
+                  (quote_no, pid, proj_row["client_name"], proj_row["client_phone"], proj_row["address"], desc, subtotal, markup, markup_val, discount, vat, vat_val, total, str(valid_until), terms, "Draft", datetime.now().isoformat()))
+                qid=fetch_one("SELECT id FROM quotes WHERE quote_no=?", (quote_no,))["id"]
+                q("INSERT INTO quote_items (quote_id, description, qty, unit, unit_price, line_total) VALUES (?,?,?,?,?,?)",
+                  (qid, item_desc, qty, unit, unit_price, subtotal))
+                log_action("CREATE","quote",quote_no,f"R{total:,.0f}")
+                st.success(f"Quote {quote_no} created R{total:,.0f}")
+                # PDF
+                quote_row=fetch_one("SELECT * FROM quotes WHERE id=?", (qid,))
+                items=fetch_all("SELECT * FROM quote_items WHERE quote_id=?", (qid,))
+                path=quote_pdf(quote_row, items, quote_row["client_name"], quote_row["address"])
+                with open(path,"rb") as f:
+                    st.download_button("Download Quote PDF", f, file_name=f"{quote_no}.pdf")
+                wa_msg=quote_message(proj_row["name"], proj_row["client_name"] or "Client", quote_no, total)
+                st.markdown(f"[💬 Send Quote via WhatsApp]({wa_link(proj_row['client_phone'], wa_msg)})")
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT * FROM quotes ORDER BY id DESC", conn)
+    conn.close()
+    st.dataframe(df, use_container_width=True)
+
+elif page=="🧾 Invoices":
+    st.title("🧾 Invoices")
+    with st.form("inv_form"):
+        a,b = st.columns(2)
+        proj_sel = a.selectbox("Project", list(project_options.keys()) if project_options else ["None"])
+        inv_date=b.date_input("Invoice Date", date.today())
+        due=b.date_input("Due Date", date.today()+timedelta(days=7))
+        desc=st.text_area("Description")
+        c,d = st.columns(2)
+        item_desc=c.text_input("Item Description")
+        amt=d.number_input("Amount R", value=0.0)
+        bank=st.text_input("Bank Details", value="Nova Vital | Capitec | Acc 123456 | Ref Invoice No")
+        if st.form_submit_button("Create Invoice"):
+            if project_options:
+                pid=project_options[proj_sel]
+                proj_row=fetch_one("SELECT * FROM projects WHERE id=?", (pid,))
+                inv_no=f"INV-{datetime.now().year}-{int(datetime.now().timestamp())%100000}"
+                q("""INSERT INTO invoices
+                    (invoice_no, project_id, client_name, invoice_date, due_date, description, subtotal, total, balance_due, status, bank_details, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (inv_no, pid, proj_row["client_name"], str(inv_date), str(due), desc, amt, amt, amt, "Not Paid", bank, datetime.now().isoformat()))
+                iid=fetch_one("SELECT id FROM invoices WHERE invoice_no=?", (inv_no,))["id"]
+                q("INSERT INTO invoice_items (invoice_id, description, qty, unit_price, line_total) VALUES (?,?,?,?,?)",
+                  (iid, item_desc, 1, amt, amt))
+                st.success(f"Invoice {inv_no} created")
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT * FROM invoices ORDER BY id DESC", conn)
+    conn.close()
+    st.dataframe(df, use_container_width=True)
+    if not df.empty:
+        for _, inv in df.iterrows():
+            if inv["balance_due"]>0:
+                proj_row=fetch_one("SELECT * FROM projects WHERE id=?", (inv["project_id"],))
+                if proj_row:
+                    wa_msg=invoice_message(proj_row["name"], inv["client_name"], inv["invoice_no"], inv["balance_due"])
+                    st.markdown(f"[💬 Remind {inv['client_name']} for {inv['invoice_no']}]({wa_link(proj_row['client_phone'], wa_msg)})")
+
+elif page=="🔄 Variations":
+    st.title("🔄 Variation Orders")
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT v.*, p.name as project_name, p.client_phone, p.client_name FROM variations v JOIN projects p ON v.project_id=p.id ORDER BY v.id DESC", conn)
+    conn.close()
+    st.dataframe(df, use_container_width=True)
+    if not df.empty:
+        for _, v in df.iterrows():
+            col1,col2 = st.columns(2)
+            if v["status"]!="Approved":
+                if col1.button(f"Approve {v['variation_no']}", key=f"app_{v['id']}"):
+                    q("UPDATE variations SET status='Approved' WHERE id=?", (v["id"],))
+                    st.rerun()
+            path=variation_pdf(v, v["project_name"])
+            with open(path,"rb") as f:
+                col2.download_button(f"PDF {v['variation_no']}", f, file_name=f"{v['variation_no']}.pdf", key=f"pdf_{v['id']}")
+
+elif page=="🛒 Procurement":
+    st.title("🛒 Procurement")
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT pr.*, p.name as project_name FROM procurement pr JOIN projects p ON pr.project_id=p.id", conn)
+    conn.close()
+    if not df.empty:
+        not_ordered=df[df["status"]=="Required"]
+        ordered=df[df["status"]=="Ordered"]
+        c1,c2,c3 = st.columns(3)
+        c1.metric("🔴 Not Ordered", len(not_ordered))
+        c2.metric("🟡 Ordered Not Received", len(ordered))
+        c3.metric("Total Value", money(df["actual_price"].sum() + df["quoted_price"].sum()))
+        st.dataframe(df, use_container_width=True)
+
+elif page=="📦 Inventory":
+    st.title("📦 Workshop Inventory")
+    with st.form("inv_add"):
+        a,b,c,d = st.columns(4)
+        item=a.text_input("Item*")
+        cat=b.text_input("Category", placeholder="Board, Hardware")
+        qty=c.number_input("Qty", value=0.0)
+        reorder=d.number_input("Reorder Level", value=5.0)
+        e,f,g = st.columns(3)
+        cost=e.number_input("Unit Cost", value=0.0)
+        unit=f.text_input("Unit", value="pcs")
+        sup=g.text_input("Supplier")
+        if st.form_submit_button("Add/Update Stock"):
+            if item:
+                existing=fetch_one("SELECT * FROM inventory WHERE item=?", (item,))
+                if existing:
+                    q("UPDATE inventory SET quantity=?, reorder_level=?, unit_cost=? WHERE item=?", (qty, reorder, cost, item))
+                else:
+                    q("INSERT INTO inventory (item, category, quantity, unit, reorder_level, unit_cost, supplier, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                      (item, cat, qty, unit, reorder, cost, sup, datetime.now().isoformat()))
+                st.rerun()
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT * FROM inventory", conn)
+    conn.close()
+    st.dataframe(df, use_container_width=True)
+    if not df.empty:
+        low=df[df["quantity"]<=df["reorder_level"]]
+        if not low.empty:
+            st.error(f"⚠️ Low stock alert: {', '.join(low['item'].tolist())}")
+
+elif page=="👷 Workers":
+    st.title("👷 Workers & Wages")
+    with st.form("worker_add"):
+        a,b,c,d = st.columns(4)
+        name=a.text_input("Name*")
+        phone=b.text_input("Phone")
+        role=c.text_input("Role", value="Installer")
+        rate=d.number_input("Daily Rate", value=500.0)
+        if st.form_submit_button("Add Worker"):
+            if name:
+                try:
+                    q("INSERT INTO workers (name, phone, role, default_rate, created_at) VALUES (?,?,?,?,?)",
+                      (name, phone, role, rate, datetime.now().isoformat()))
+                    st.rerun()
+                except:
+                    st.error("Worker exists")
+    conn=get_conn()
+    workers=pd.read_sql_query("SELECT * FROM workers", conn)
+    wp=pd.read_sql_query("SELECT wp.*, w.name as worker_name, p.name as project_name FROM worker_payments wp JOIN workers w ON wp.worker_id=w.id JOIN projects p ON wp.project_id=p.id", conn)
+    conn.close()
+    st.dataframe(workers, use_container_width=True)
+    st.subheader("Pay Worker")
+    if not workers.empty and project_options:
+        with st.form("pay_worker"):
+            a,b,c,d = st.columns(4)
+            w_sel=a.selectbox("Worker", workers["name"].tolist())
+            p_sel=b.selectbox("Project", list(project_options.keys()))
+            p_date=c.date_input("Date", date.today())
+            days=d.number_input("Days", value=1.0, step=0.5)
+            rate=st.number_input("Rate R", value=float(workers[workers["name"]==w_sel]["default_rate"].iloc[0]) if not workers[workers["name"]==w_sel].empty else 500.0)
+            amt=days*rate
+            st.write(f"Amount: R{amt:,.2f}")
+            if st.form_submit_button("Pay"):
+                wid=int(workers[workers["name"]==w_sel]["id"].iloc[0])
+                pid=project_options[p_sel]
+                q("INSERT INTO worker_payments (project_id, worker_id, payment_date, days, rate, amount, created_at) VALUES (?,?,?,?,?,?,?)",
+                  (pid, wid, str(p_date), days, rate, amt, datetime.now().isoformat()))
+                st.success(f"Paid R{amt:,.2f}")
+                st.rerun()
+    st.dataframe(wp, use_container_width=True)
+
+elif page=="✅ Tasks & Snags":
+    st.title("✅ Tasks & Snags Overview")
+    conn=get_conn()
+    tasks=pd.read_sql_query("SELECT t.*, p.name as project_name FROM tasks t JOIN projects p ON t.project_id=p.id", conn)
+    snags=pd.read_sql_query("SELECT s.*, p.name as project_name FROM snags s JOIN projects p ON s.project_id=p.id", conn)
+    conn.close()
+    c1,c2 = st.columns(2)
+    c1.subheader("Tasks")
+    c1.dataframe(tasks, use_container_width=True)
+    c2.subheader("Snags")
+    c2.dataframe(snags, use_container_width=True)
+
+elif page=="📓 Site Diary":
+    st.title("📓 Site Diary - All Projects")
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT sl.*, p.name as project_name FROM site_logs sl JOIN projects p ON sl.project_id=p.id ORDER BY log_date DESC", conn)
+    conn.close()
+    st.dataframe(df, use_container_width=True)
+
+elif page=="📈 Leads":
+    st.title("📈 Leads / Sales Pipeline")
+    with st.form("lead_form"):
+        a,b,c,d = st.columns(4)
+        name=a.text_input("Lead / Company*")
+        phone=b.text_input("Phone")
+        source=c.selectbox("Source", ["Referral","Facebook","Google","Developer","Repeat Client","WhatsApp","Other"])
+        ptype=d.text_input("Project Type")
+        e,f = st.columns(2)
+        value=e.number_input("Estimated Value", min_value=0.0)
+        status=f.selectbox("Status", ["New","Contacted","Site Visit","Quoted","Negotiating","Won","Lost"])
+        notes=st.text_area("Notes")
+        if st.form_submit_button("Add Lead") and name:
+            q("INSERT INTO leads (name, phone, source, project_type, estimated_value, status, notes, created_at) VALUES (?,?,?,?,?,?,?,?)",
+              (name, phone, source, ptype, value, status, notes, datetime.now().isoformat()))
+            st.rerun()
+    conn=get_conn()
+    df=pd.read_sql_query("SELECT * FROM leads ORDER BY id DESC", conn)
+    conn.close()
+    st.dataframe(df, use_container_width=True)
+    if not df.empty:
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Pipeline", money(df[df["status"].isin(["New","Contacted","Site Visit","Quoted","Negotiating"])]["estimated_value"].sum()))
+        c2.metric("Won", money(df[df["status"]=="Won"]["estimated_value"].sum()))
+        c3.metric("Lost", money(df[df["status"]=="Lost"]["estimated_value"].sum()))
+
+elif page=="🤖 AI Advisor":
+    st.title("🤖 AI Financial Advisor")
+    if not project_options:
+        st.warning("Create project first")
+        st.stop()
+    sel=st.selectbox("Select Project", list(project_options.keys()))
+    pid=project_options[sel]
+    st.markdown(f'<div style="background:linear-gradient(135deg,#151c31,#202944);padding:18px;border-radius:14px;border:1px solid #35405e">{advisor_text(pid)}</div>', unsafe_allow_html=True)
+    st.divider()
+    st.subheader("🔮 Scenario Calculator")
+    c1,c2,c3 = st.columns(3)
+    extra=c1.number_input("Extra spend R", value=0.0, step=500.0)
+    extra_pay=c2.number_input("If client pays R", value=0.0, step=1000.0)
+    labor_inc=c3.number_input("Labor increase %", value=0.0, step=5.0)
+    res=scenario_calc(pid, extra, extra_pay, labor_inc)
+    st.info(f"After scenario: Profit R{res['new_profit']:,.2f} Margin {res['new_margin']:.1f}% Cash R{res['new_cash_position']:,.2f} Outstanding R{res['new_outstanding']:,.2f}")
+
+elif page=="📊 Reports":
+    st.title("📊 Reports & BI")
+    stats=company_stats()
+    df=stats["df"]
+    if df.empty:
+        st.info("No projects")
+        st.stop()
+    st.dataframe(df, use_container_width=True)
+    csv=df.to_csv(index=False).encode()
+    st.download_button("Download Company P&L CSV", csv, "nova_vital_pl.csv")
+    # Excel
+    try:
+        import io
+        output=io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name="P&L", index=False)
+        st.download_button("Download Excel", output.getvalue(), "nova_vital.xlsx")
+    except:
+        pass
+    if project_options:
+        sel=st.selectbox("Detailed PDF Report", list(project_options.keys()))
+        if st.button("Generate PDF"):
+            pid=project_options[sel]
+            proj=fetch_one("SELECT * FROM projects WHERE id=?", (pid,))
+            s=project_stats(pid)
+            conn=get_conn()
+            exp_df=pd.read_sql_query("SELECT * FROM expenses WHERE project_id=?", conn, params=(pid,))
+            conn.close()
+            path=project_report_pdf(proj, s, exp_df)
+            with open(path,"rb") as f:
+                st.download_button("Download PDF", f, file_name=f"{sel}_Report.pdf")
+
+elif page=="⚙️ Settings":
+    st.title("⚙️ Settings")
+    st.write(f"Database: {DB_FILE} | PIN via env NOVA_PIN (current default 1234)")
+    st.write("Migrations: financial_db.json -> SQLite auto-migrated with backup")
+    if st.button("Logout"):
+        st.session_state.auth=False
+        st.rerun()
+    st.divider()
+    st.subheader("Audit Log")
+    conn=get_conn()
+    logs=pd.read_sql_query("SELECT * FROM audit_log ORDER BY id DESC LIMIT 200", conn)
+    conn.close()
+    st.dataframe(logs, use_container_width=True)
+    st.subheader("Backup")
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE,"rb") as f:
+            st.download_button("Download SQLite DB", f, file_name="nova_vital_backup.db")
+
+st.sidebar.divider()
+st.sidebar.caption("Nova Vital Advisor OS - Production v3")
